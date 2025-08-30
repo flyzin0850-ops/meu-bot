@@ -1,6 +1,5 @@
-requests
-beautifulsoup4
-python-telegram-bot[webhooks]
-webdriver-manager
 selenium
-python-dotenv
+webdriver-manager
+python-telegram-bot
+beautifulsoup4
+requests
