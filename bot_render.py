@@ -1,106 +1,133 @@
 import os
 import re
 import time
-import logging
-import requests
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 from telegram import Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.ext import Updater
 
-# 🔹 Token e chat ID via environment variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # seu ID ou do grupo
+# ----------------------------
+# Variáveis de ambiente
+# ----------------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = int(os.environ.get("CHAT_ID"))
+PORT = int(os.environ.get("PORT", 5000))
+URL = os.environ.get("RENDER_EXTERNAL_URL")
 
-if not BOT_TOKEN or not CHAT_ID:
-    raise ValueError("❌ BOT_TOKEN ou CHAT_ID não configurados!")
+if not BOT_TOKEN or not CHAT_ID or not URL:
+    raise ValueError("❌ BOT_TOKEN, CHAT_ID ou RENDER_EXTERNAL_URL não configurados!")
 
 bot = Bot(token=BOT_TOKEN)
 
-# Logs
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-
-# Palavras-chave e preço máximo
+# ----------------------------
+# Configurações de scraping
+# ----------------------------
 PALAVRAS_CHAVE = ["blackcell", "cp", "pack"]
-PRECO_MAXIMO = 5.0
+DATA_CORTE = datetime.strptime("2024-01-01", "%Y-%m-%d")
 
-BASE_URL = "https://lzt.market/battlenet/"
+options = Options()
+options.add_argument("--disable-gpu")
+options.add_argument("--disable-software-rasterizer")
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+wait = WebDriverWait(driver, 5)
 
-# Função para validar transações
-def transacao_valida(texto, preco_str):
+# ----------------------------
+# Funções utilitárias
+# ----------------------------
+def transacao_valida(texto, data_str):
     texto_lower = texto.lower()
     try:
-        preco = float(preco_str.replace("R$", "").replace(",", ".").strip())
+        data = datetime.strptime(data_str, "%b %d, %Y")
     except:
         return False
-    if preco > PRECO_MAXIMO:
+    if any(p in texto_lower for p in ["cp", "pack"]) and data < DATA_CORTE:
         return False
     return any(p in texto_lower for p in PALAVRAS_CHAVE)
 
-# Comando /start
 async def start(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot rodando e monitorando anúncios! 🚀")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="🤖 Bot rodando!")
 
-# Função de monitoramento turbo
-def monitorar():
-    vistos = set()
+async def buscar_anuncios(update=None, context=None):
+    """
+    Função principal para buscar anúncios e enviar alertas no Telegram
+    """
+    categoria_url = "https://lzt.market/battlenet/?page=1"  # você pode alterar ou pegar de input
     pagina = 1
+    encontrados = 0
+
     while True:
-        try:
-            url = f"{BASE_URL}?page={pagina}"
-            r = requests.get(url, timeout=5)
-            r.raise_for_status()
-            html = r.text
+        driver.get(categoria_url)
+        time.sleep(0.2)
+        html = driver.page_source
+        links = re.findall(r'href="(https://lzt\.market/\d+/[^"]+)"', html)
+        if not links:
+            break
 
-            anuncios = re.findall(r'<a href="(https://lzt\.market/\d+/[^"]+)".*?</a>.*?id="price">(.*?)<', html, re.DOTALL)
-            if not anuncios:
-                pagina = 1
-                time.sleep(0.5)
+        for link in links:
+            try:
+                driver.get(link)
+                time.sleep(0.1)
+                html = driver.page_source
+                trs = re.findall(r"<tr class=\"dataRow.*?</tr>", html, re.DOTALL)
+                transacoes_relevantes = []
+
+                for tr in trs:
+                    cols = re.findall(r"<td.*?>(.*?)</td>", tr, re.DOTALL)
+                    if len(cols) >= 3:
+                        texto = re.sub(r"<.*?>", "", cols[0]).strip()
+                        data_match = re.search(r'title="(.*?) at', tr)
+                        if data_match:
+                            data_texto = data_match.group(1).strip()
+                            if transacao_valida(texto, data_texto):
+                                transacoes_relevantes.append(f"{texto} ({data_texto})")
+
+                if transacoes_relevantes:
+                    preco_match = re.search(r'id="price">(.*?)<', html)
+                    preco = preco_match.group(1).strip() if preco_match else "N/A"
+                    mensagem = f"🔔 Nova conta!\n💰 Preço: {preco}\n🔗 {link}\n📦 Transações:\n" + "\n".join(transacoes_relevantes)
+                    await bot.send_message(chat_id=CHAT_ID, text=mensagem)
+                    encontrados += 1
+            except:
                 continue
+            time.sleep(0.05)
 
-            for link, preco in anuncios:
-                if (link, preco) in vistos:
-                    continue
+        pagina += 1
+        if "?" in categoria_url:
+            categoria_url = re.sub(r"([?&]page=)\d+", f"?page={pagina}", categoria_url)
+        else:
+            categoria_url += f"?page={pagina}"
 
-                if transacao_valida(link, preco):
-                    msg = f"🔔 Conta boa encontrada!\n💰 Preço: {preco}\n🔗 {link}"
-                    bot.send_message(chat_id=CHAT_ID, text=msg)
-                    logging.info(f"Enviado: {link} | Preço: {preco}")
+# ----------------------------
+# Configuração Telegram
+# ----------------------------
+application = Application.builder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
 
-                vistos.add((link, preco))
-                time.sleep(0.25)  # 4 anúncios por segundo
+# Inicia scraping periodicamente
+import asyncio
+async def scraping_loop():
+    while True:
+        await buscar_anuncios()
+        await asyncio.sleep(30)  # espera 30s entre verificações
 
-            pagina += 1
+application.create_task(scraping_loop())
 
-        except Exception as e:
-            logging.error(f"Erro ao buscar anúncios: {e}")
-            time.sleep(2)
+# ----------------------------
+# Inicia webhook
+# ----------------------------
+application.run_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    url_path=BOT_TOKEN,
+    webhook_url=f"{URL}/webhook/{BOT_TOKEN}"
+)
 
-# Main
-def main():
-    from threading import Thread
-    from telegram.ext import ApplicationBuilder
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
 
-    # Thread para monitorar anúncios
-    Thread(target=monitorar, daemon=True).start()
-
-    # Configurar webhook
-    PORT = int(os.environ.get("PORT", 5000))
-    URL = os.environ.get("RENDER_EXTERNAL_URL")  # Render disponibiliza essa variável
-    if not URL:
-        raise ValueError("❌ RENDER_EXTERNAL_URL não configurada!")
-
-    webhook_url = f"{URL}/webhook/{BOT_TOKEN}"
-    bot.set_webhook(webhook_url)
-    logging.info(f"Webhook set at {webhook_url}")
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=webhook_url
-    )
-
-if __name__ == "__main__":
-    main()
+ 
