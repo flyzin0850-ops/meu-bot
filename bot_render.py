@@ -4,10 +4,10 @@ import time
 import logging
 import requests
 from telegram import Bot
-from telegram.ext import Application, CommandHandler
-import threading
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Updater
 
-# 🔹 Token e chat ID
+# 🔹 Token e chat ID via environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")  # seu ID ou do grupo
 
@@ -23,7 +23,6 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 PALAVRAS_CHAVE = ["blackcell", "cp", "pack"]
 PRECO_MAXIMO = 5.0
 
-# URL base da categoria
 BASE_URL = "https://lzt.market/battlenet/"
 
 # Função para validar transações
@@ -38,14 +37,13 @@ def transacao_valida(texto, preco_str):
     return any(p in texto_lower for p in PALAVRAS_CHAVE)
 
 # Comando /start
-async def start(update, context):
+async def start(update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 Bot rodando e monitorando anúncios! 🚀")
 
 # Função de monitoramento turbo
 def monitorar():
-    vistos = set()  # links já enviados
+    vistos = set()
     pagina = 1
-
     while True:
         try:
             url = f"{BASE_URL}?page={pagina}"
@@ -53,11 +51,9 @@ def monitorar():
             r.raise_for_status()
             html = r.text
 
-            # Captura links e preços
             anuncios = re.findall(r'<a href="(https://lzt\.market/\d+/[^"]+)".*?</a>.*?id="price">(.*?)<', html, re.DOTALL)
-
             if not anuncios:
-                pagina = 1  # volta para a primeira página se não houver anúncios
+                pagina = 1
                 time.sleep(0.5)
                 continue
 
@@ -81,13 +77,30 @@ def monitorar():
 
 # Main
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    from threading import Thread
+    from telegram.ext import ApplicationBuilder
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
 
-    # Inicia monitoramento em thread separada
-    threading.Thread(target=monitorar, daemon=True).start()
+    # Thread para monitorar anúncios
+    Thread(target=monitorar, daemon=True).start()
 
-    app.run_polling()
+    # Configurar webhook
+    PORT = int(os.environ.get("PORT", 5000))
+    URL = os.environ.get("RENDER_EXTERNAL_URL")  # Render disponibiliza essa variável
+    if not URL:
+        raise ValueError("❌ RENDER_EXTERNAL_URL não configurada!")
+
+    webhook_url = f"{URL}/webhook/{BOT_TOKEN}"
+    bot.set_webhook(webhook_url)
+    logging.info(f"Webhook set at {webhook_url}")
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=webhook_url
+    )
 
 if __name__ == "__main__":
     main()
