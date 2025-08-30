@@ -1,133 +1,107 @@
 import os
-import re
-import time
-from datetime import datetime
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+import requests
+from bs4 import BeautifulSoup
 from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import TelegramError
+from dotenv import load_dotenv
+from datetime import datetime
 
-# ----------------------------
-# Variáveis de ambiente
-# ----------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = int(os.environ.get("CHAT_ID"))
-PORT = int(os.environ.get("PORT", 5000))
-URL = os.environ.get("RENDER_EXTERNAL_URL")
+load_dotenv()
 
-if not BOT_TOKEN or not CHAT_ID or not URL:
-    raise ValueError("❌ BOT_TOKEN, CHAT_ID ou RENDER_EXTERNAL_URL não configurados!")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+PRECO_MAXIMO = float(os.getenv("PRECO_MAXIMO", 5))
+
+if not BOT_TOKEN or not CHAT_ID:
+    raise ValueError("❌ BOT_TOKEN ou CHAT_ID não configurados!")
 
 bot = Bot(token=BOT_TOKEN)
 
-# ----------------------------
-# Configurações de scraping
-# ----------------------------
 PALAVRAS_CHAVE = ["blackcell", "cp", "pack"]
 DATA_CORTE = datetime.strptime("2024-01-01", "%Y-%m-%d")
+VISITADOS = set()  # evita repetições
 
-options = Options()
-options.add_argument("--disable-gpu")
-options.add_argument("--disable-software-rasterizer")
-driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-wait = WebDriverWait(driver, 5)
-
-# ----------------------------
-# Funções utilitárias
-# ----------------------------
 def transacao_valida(texto, data_str):
     texto_lower = texto.lower()
     try:
         data = datetime.strptime(data_str, "%b %d, %Y")
     except:
         return False
+
     if any(p in texto_lower for p in ["cp", "pack"]) and data < DATA_CORTE:
         return False
     return any(p in texto_lower for p in PALAVRAS_CHAVE)
 
-async def start(update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="🤖 Bot rodando!")
+def buscar_anuncios(url):
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"❌ Erro ao acessar {url}: {e}")
+        return []
 
-async def buscar_anuncios(update=None, context=None):
-    """
-    Função principal para buscar anúncios e enviar alertas no Telegram
-    """
-    categoria_url = "https://lzt.market/battlenet/?page=1"  # você pode alterar ou pegar de input
-    pagina = 1
-    encontrados = 0
+    soup = BeautifulSoup(r.text, "html.parser")
+    links = [a["href"] for a in soup.select("a.marketIndexItem--Title.PopupItemLink") if a.get("href")]
+    return links
 
-    while True:
-        driver.get(categoria_url)
-        time.sleep(0.2)
-        html = driver.page_source
-        links = re.findall(r'href="(https://lzt\.market/\d+/[^"]+)"', html)
-        if not links:
-            break
+def processar_conta(link):
+    if link in VISITADOS:
+        return
+    VISITADOS.add(link)
 
-        for link in links:
-            try:
-                driver.get(link)
-                time.sleep(0.1)
-                html = driver.page_source
-                trs = re.findall(r"<tr class=\"dataRow.*?</tr>", html, re.DOTALL)
-                transacoes_relevantes = []
+    try:
+        r = requests.get(link, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"❌ Erro em {link}: {e}")
+        return
 
-                for tr in trs:
-                    cols = re.findall(r"<td.*?>(.*?)</td>", tr, re.DOTALL)
-                    if len(cols) >= 3:
-                        texto = re.sub(r"<.*?>", "", cols[0]).strip()
-                        data_match = re.search(r'title="(.*?) at', tr)
-                        if data_match:
-                            data_texto = data_match.group(1).strip()
-                            if transacao_valida(texto, data_texto):
-                                transacoes_relevantes.append(f"{texto} ({data_texto})")
+    soup = BeautifulSoup(r.text, "html.parser")
+    trs = soup.select("table tr.dataRow")
+    transacoes_relevantes = []
 
-                if transacoes_relevantes:
-                    preco_match = re.search(r'id="price">(.*?)<', html)
-                    preco = preco_match.group(1).strip() if preco_match else "N/A"
-                    mensagem = f"🔔 Nova conta!\n💰 Preço: {preco}\n🔗 {link}\n📦 Transações:\n" + "\n".join(transacoes_relevantes)
-                    await bot.send_message(chat_id=CHAT_ID, text=mensagem)
-                    encontrados += 1
-            except:
+    for tr in trs:
+        tds = tr.find_all("td")
+        if len(tds) >= 3:
+            texto = tds[0].get_text(strip=True)
+            data_elem = tds[2].find(class_="DateTime")
+            if not data_elem:
                 continue
-            time.sleep(0.05)
+            data_texto = data_elem.get("title", "").split(" at ")[0].strip()
+            if transacao_valida(texto, data_texto):
+                transacoes_relevantes.append(f"{texto} ({data_texto})")
 
-        pagina += 1
-        if "?" in categoria_url:
-            categoria_url = re.sub(r"([?&]page=)\d+", f"?page={pagina}", categoria_url)
-        else:
-            categoria_url += f"?page={pagina}"
+    if transacoes_relevantes:
+        preco_elem = soup.select_one("#price")
+        preco = preco_elem.get_text(strip=True) if preco_elem else "N/A"
 
-# ----------------------------
-# Configuração Telegram
-# ----------------------------
-application = Application.builder().token(BOT_TOKEN).build()
-application.add_handler(CommandHandler("start", start))
+        try:
+            preco_float = float(preco.replace("R$", "").replace(",", "."))
+        except:
+            preco_float = float("inf")
 
-# Inicia scraping periodicamente
-import asyncio
-async def scraping_loop():
+        if preco_float <= PRECO_MAXIMO:
+            msg = f"🔗 {link}\n💰 Preço: {preco}\n📦 Transações:\n" + "\n".join(f"• {t}" for t in transacoes_relevantes)
+            try:
+                bot.send_message(chat_id=CHAT_ID, text=msg)
+                print(f"✅ Conta enviada: {link}")
+            except TelegramError as e:
+                print(f"❌ Erro ao enviar Telegram: {e}")
+
+# 🚀 Loop principal
+CATEGORIAS = [
+    "https://lzt.market/battlenet/?page=1",
+]
+
+for categoria_url in CATEGORIAS:
+    pagina = 1
     while True:
-        await buscar_anuncios()
-        await asyncio.sleep(30)  # espera 30s entre verificações
-
-application.create_task(scraping_loop())
-
-# ----------------------------
-# Inicia webhook
-# ----------------------------
-application.run_webhook(
-    listen="0.0.0.0",
-    port=PORT,
-    url_path=BOT_TOKEN,
-    webhook_url=f"{URL}/webhook/{BOT_TOKEN}"
-)
-
-
-
- 
+        url_pag = re.sub(r"([?&]page=)\d+", f"?page={pagina}", categoria_url)
+        print(f"📄 Página {pagina}: {url_pag}")
+        links = buscar_anuncios(url_pag)
+        if not links:
+            print("⚠️ Nenhum anúncio visível. Encerrando categoria.")
+            break
+        for link in links:
+            processar_conta(link)
+        pagina += 1
